@@ -130,6 +130,7 @@ type ChannelConfig struct {
 	Webhooks       []Webhook `yaml:"webhooks"`        // destinations
 	MinimumAlerts  int       `yaml:"minimum_alerts"`  // N triggers required (0/1 => immediate)
 	MinimumTimeSec int       `yaml:"minimum_time"`    // seconds window (0 => immediate)
+	CoolingTimeSec int       `yaml:"cooling_time"`    // seconds between webhook sends (0 => none)
 }
 
 type cfg struct {
@@ -189,7 +190,6 @@ type pairPending struct {
 	when time.Time
 }
 
-// per-bit trigger history for thresholding
 type triggerHistory struct {
 	times map[int][]time.Time // bit -> timestamps
 }
@@ -198,23 +198,18 @@ func newTriggerHistory() *triggerHistory {
 	return &triggerHistory{times: make(map[int][]time.Time)}
 }
 
-// record a trigger and return whether channel meets min-alerts/min-time window
 func (h *triggerHistory) qualifies(bit int, ch ChannelConfig, now time.Time) bool {
-	// Immediate if not configured
+	// record first
+	h.times[bit] = append(h.times[bit], now)
+
+	// immediate if not configured
 	if ch.MinimumAlerts <= 1 || ch.MinimumTimeSec <= 0 {
-		// Still record for future windows
-		h.times[bit] = append(h.times[bit], now)
-		// keep history from growing unbounded — trim older than, say, 15 minutes
-		cut := now.Add(-15 * time.Minute)
-		h.trimBefore(bit, cut)
+		h.trimBefore(bit, now.Add(-15*time.Minute))
 		return true
 	}
 
 	win := time.Duration(ch.MinimumTimeSec) * time.Second
 	cutoff := now.Add(-win)
-
-	// Append now, then prune before counting
-	h.times[bit] = append(h.times[bit], now)
 	h.trimBefore(bit, cutoff)
 
 	// Count entries >= cutoff
@@ -232,7 +227,6 @@ func (h *triggerHistory) trimBefore(bit int, cutoff time.Time) {
 	if len(ts) == 0 {
 		return
 	}
-	// find first ts[i] >= cutoff
 	i := 0
 	for i < len(ts) && ts[i].Before(cutoff) {
 		i++
@@ -240,14 +234,12 @@ func (h *triggerHistory) trimBefore(bit int, cutoff time.Time) {
 	if i > 0 {
 		ts = ts[i:]
 	}
-	// keep array from ballooning (safety)
 	if len(ts) > 1000 {
 		ts = ts[len(ts)-1000:]
 	}
 	h.times[bit] = ts
 }
 
-// returns the channel config for a bit, or nil if not found
 func chanByBit(chs []ChannelConfig, bit int) *ChannelConfig {
 	for i := range chs {
 		if chs[i].Bit == bit {
@@ -255,6 +247,22 @@ func chanByBit(chs []ChannelConfig, bit int) *ChannelConfig {
 		}
 	}
 	return nil
+}
+
+// cooldown guard per channel bit
+func passCooldown(last map[int]time.Time, ch ChannelConfig, bit int, now time.Time) bool {
+	if ch.CoolingTimeSec <= 0 {
+		return true
+	}
+	lastT, ok := last[bit]
+	if !ok {
+		return true
+	}
+	return now.Sub(lastT) >= time.Duration(ch.CoolingTimeSec)*time.Second
+}
+
+func markCooldown(last map[int]time.Time, bit int, now time.Time) {
+	last[bit] = now
 }
 
 func main() {
@@ -285,8 +293,9 @@ func main() {
 		debounce      = time.Duration(cfg.DebounceMS) * time.Millisecond
 		ticker        = time.NewTicker(20 * time.Millisecond)
 
-		pending = map[int]pairPending{} // pending per-bit for pair logic
-		hist    = newTriggerHistory()   // per-bit trigger history for thresholds
+		pending    = map[int]pairPending{} // pending per-bit for pair logic
+		hist       = newTriggerHistory()   // per-bit trigger history for thresholds
+		lastNotify = map[int]time.Time{}   // per-bit cooldown tracking
 	)
 	defer ticker.Stop()
 
@@ -322,7 +331,6 @@ func main() {
 			if edges != 0 {
 				now := time.Now()
 
-				// Handle all changed bits
 				for bit := 0; bit < 8; bit++ {
 					mask := byte(1 << bit)
 					if edges&mask == 0 {
@@ -338,60 +346,77 @@ func main() {
 						continue
 					}
 
-					// ---- Pair logic (if configured) ----
+					// ---- Paired channels ----
 					if ch.PairBit != nil {
 						pairBit := *ch.PairBit
 
-						// prune stale pair entries (optional: only when used)
+						// See if pairBit is pending and within window
 						if pp, ok := pending[pairBit]; ok {
-							// Check window using *this* channel's pair window (second channel governs)
 							window := time.Duration(ch.PairWindowSec) * time.Second
 							if window <= 0 {
 								window = 60 * time.Second
 							}
 							if now.Sub(pp.when) <= window {
-								// Threshold check for the *current* channel (the one completing the pair)
-								if hist.qualifies(bit, *ch, now) {
-									msg := ch.PairMessage
-									if strings.TrimSpace(msg) == "" {
-										msg = fmt.Sprintf("%s & bit%d pair matched", ch.Name, pairBit+1)
-									}
-									log.Printf("PAIR %s (bit%d<->bit%d) @ %s", ch.Name, bit, pairBit, now.Format(time.RFC3339))
-									for _, w := range ch.Webhooks {
-										sendViaWebhook(w, msg)
-									}
-								} else {
+								// Threshold & cooldown for the *current* channel
+								if !hist.qualifies(bit, *ch, now) {
 									log.Printf("PAIR met but threshold not satisfied for %s (bit%d)", ch.Name, bit)
+									// consume both to avoid stale
+									delete(pending, pairBit)
+									delete(pending, bit)
+									continue
 								}
+								if !passCooldown(lastNotify, *ch, bit, now) {
+									log.Printf("Cooling active for %s (bit%d) — skipping send", ch.Name, bit)
+									// consume both sides anyway to avoid repeated pair spam
+									delete(pending, pairBit)
+									delete(pending, bit)
+									continue
+								}
+
+								msg := ch.PairMessage
+								if strings.TrimSpace(msg) == "" {
+									msg = fmt.Sprintf("%s & bit%d pair matched", ch.Name, pairBit+1)
+								}
+								log.Printf("PAIR %s (bit%d<->bit%d) @ %s", ch.Name, bit, pairBit, now.Format(time.RFC3339))
+								for _, w := range ch.Webhooks {
+									sendViaWebhook(w, msg)
+								}
+								markCooldown(lastNotify, bit, now)
 								// consume both sides
 								delete(pending, pairBit)
 								delete(pending, bit)
 								continue
 							}
-							// stale pair — discard and fall through to set our pending below
+							// stale pair — drop it and continue to set our pending below
 							delete(pending, pairBit)
 						}
 
-						// No valid pair yet — start/refresh our pending timer and record hit for threshold history
+						// Start/refresh our pending + record for thresholds
 						pending[bit] = pairPending{when: now}
-						_ = hist.qualifies(bit, *ch, now) // just record; don't alert yet
+						_ = hist.qualifies(bit, *ch, now) // record only
 						continue
 					}
 
-					// ---- Unpaired channel: threshold -> alert ----
-					if hist.qualifies(bit, *ch, now) {
-						name := ch.Name
-						if name == "" {
-							name = fmt.Sprintf("Input %d", bit+1)
-						}
-						msg := fmt.Sprintf("🚨 Alert: %s @ %s", name, now.Format(time.RFC3339))
-						for _, w := range ch.Webhooks {
-							sendViaWebhook(w, msg)
-						}
-						log.Println(msg)
-					} else {
+					// ---- Unpaired channels ----
+					if !hist.qualifies(bit, *ch, now) {
 						log.Printf("Threshold not yet met for %s (bit%d)", ch.Name, bit)
+						continue
 					}
+					if !passCooldown(lastNotify, *ch, bit, now) {
+						log.Printf("Cooling active for %s (bit%d) — skipping send", ch.Name, bit)
+						continue
+					}
+
+					name := ch.Name
+					if name == "" {
+						name = fmt.Sprintf("Input %d", bit+1)
+					}
+					msg := fmt.Sprintf("🚨 Alert: %s @ %s", name, now.Format(time.RFC3339))
+					for _, w := range ch.Webhooks {
+						sendViaWebhook(w, msg)
+					}
+					log.Println(msg)
+					markCooldown(lastNotify, bit, now)
 				}
 			}
 
