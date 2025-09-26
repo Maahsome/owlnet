@@ -120,6 +120,15 @@ func sendToPushcut(url, msg string) {
 	_ = resp.Body.Close()
 }
 
+// helper: send trip log only to Slack webhooks
+func sendTripSlackOnly(webhooks []Webhook, msg string) {
+	for _, w := range webhooks {
+		if strings.ToLower(w.Type) == "slack" {
+			sendToSlack(w.URL, msg)
+		}
+	}
+}
+
 // ---------- Config (YAML) ----------
 type ChannelConfig struct {
 	Name           string    `yaml:"name"`            // Friendly name
@@ -346,6 +355,18 @@ func main() {
 						continue
 					}
 
+					// ---- Trip logging for D1..D4 (bits 0..3) ----
+					if bit >= 0 && bit <= 3 {
+						name := ch.Name
+						if name == "" {
+							name = fmt.Sprintf("Input %d", bit+1)
+						}
+						tripMsg := fmt.Sprintf("📟 Trip: %s (bit%d) @ %s", name, bit+1, now.Format(time.RFC3339))
+						log.Println(tripMsg)
+						// Send trip log only to Slack webhooks for this channel (no thresholds/cooldown here)
+						sendTripSlackOnly(ch.Webhooks, tripMsg)
+					}
+
 					// ---- Paired channels ----
 					if ch.PairBit != nil {
 						pairBit := *ch.PairBit
@@ -360,14 +381,12 @@ func main() {
 								// Threshold & cooldown for the *current* channel
 								if !hist.qualifies(bit, *ch, now) {
 									log.Printf("PAIR met but threshold not satisfied for %s (bit%d)", ch.Name, bit)
-									// consume both to avoid stale
 									delete(pending, pairBit)
 									delete(pending, bit)
 									continue
 								}
 								if !passCooldown(lastNotify, *ch, bit, now) {
 									log.Printf("Cooling active for %s (bit%d) — skipping send", ch.Name, bit)
-									// consume both sides anyway to avoid repeated pair spam
 									delete(pending, pairBit)
 									delete(pending, bit)
 									continue
@@ -382,7 +401,6 @@ func main() {
 									sendViaWebhook(w, msg)
 								}
 								markCooldown(lastNotify, bit, now)
-								// consume both sides
 								delete(pending, pairBit)
 								delete(pending, bit)
 								continue
